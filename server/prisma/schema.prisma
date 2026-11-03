@@ -7,6 +7,10 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ============================================================================
+// ENUMS
+// ============================================================================
+
 enum WorkspaceStatus {
   ACTIVE
   SUSPENDED
@@ -23,6 +27,58 @@ enum AuditResult {
   FAILURE
 }
 
+enum ContactStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+enum ConsentStatus {
+  UNKNOWN
+  OPTED_IN
+  OPTED_OUT
+  NOT_APPLICABLE
+}
+
+enum SuppressionReason {
+  UNSUBSCRIBE
+  COMPLAINT
+  HARD_BOUNCE
+  INVALID
+  MANUAL
+  COMPLIANCE
+  OTHER
+}
+
+enum ImportStatus {
+  UPLOADED
+  MAPPED
+  VALIDATING
+  VALIDATED
+  COMMITTING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+/// Preview outcomes (NEW..SUPPRESSED) are set at validation; final outcomes (CREATED..FAILED) at commit.
+enum ImportRowOutcome {
+  PENDING
+  NEW
+  EXISTING
+  DUPLICATE_IN_FILE
+  INVALID
+  SUPPRESSED
+  CREATED
+  UPDATED
+  SKIPPED
+  FAILED
+}
+
+// ============================================================================
+// PHASE 0: tenancy, auth, RBAC, audit
+// ============================================================================
+
 model Workspace {
   id        String          @id @default(uuid()) @db.Uuid
   name      String          @db.VarChar(160)
@@ -33,9 +89,15 @@ model Workspace {
   createdAt DateTime        @default(now()) @map("created_at") @db.Timestamptz
   updatedAt DateTime        @updatedAt @map("updated_at") @db.Timestamptz
 
-  users     User[]
-  roles     Role[]
-  auditLogs AuditLog[]
+  users               User[]
+  roles               Role[]
+  auditLogs           AuditLog[]
+  contacts            Contact[]
+  contactCustomFields ContactCustomField[]
+  contactEvents       ContactEvent[]
+  tags                Tag[]
+  imports             Import[]
+  suppressions        Suppression[]
 
   @@map("workspaces")
 }
@@ -57,6 +119,7 @@ model User {
   sessions    Session[]
   resetTokens PasswordResetToken[]
   auditLogs   AuditLog[]
+  imports     Import[]
 
   @@unique([workspaceId, email])
   @@index([workspaceId, status])
@@ -165,4 +228,168 @@ model AuditLog {
   @@index([createdAt, workspaceId])
   @@index([workspaceId, action])
   @@map("audit_logs")
+}
+
+// ============================================================================
+// PHASE 1A: contacts, tags, suppressions, imports
+// ============================================================================
+
+model Contact {
+  id              String        @id @default(uuid()) @db.Uuid
+  workspaceId     String        @map("workspace_id") @db.Uuid
+  /// Canonical lowercase email. Used for dedupe and suppression matching.
+  emailNormalized String        @map("email_normalized") @db.VarChar(320)
+  /// Exactly as the user entered/imported it.
+  emailOriginal   String        @map("email_original") @db.VarChar(320)
+  firstName       String?       @map("first_name") @db.VarChar(120)
+  lastName        String?       @map("last_name") @db.VarChar(120)
+  company         String?       @db.VarChar(200)
+  title           String?       @db.VarChar(160)
+  phone           String?       @db.VarChar(64)
+  source          String?       @db.VarChar(100)
+  sourceRef       String?       @map("source_ref") @db.VarChar(255)
+  status          ContactStatus @default(ACTIVE)
+  consentStatus   ConsentStatus @default(UNKNOWN) @map("consent_status")
+  consentAt       DateTime?     @map("consent_at") @db.Timestamptz
+  lastEngagedAt   DateTime?     @map("last_engaged_at") @db.Timestamptz
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+
+  workspace    Workspace            @relation(fields: [workspaceId], references: [id])
+  customFields ContactCustomField[]
+  events       ContactEvent[]
+  tags         ContactTag[]
+
+  @@unique([workspaceId, emailNormalized])
+  @@index([workspaceId, status])
+  @@index([workspaceId, createdAt])
+  @@map("contacts")
+}
+
+model ContactCustomField {
+  id          String  @id @default(uuid()) @db.Uuid
+  workspaceId String  @map("workspace_id") @db.Uuid
+  contactId   String  @map("contact_id") @db.Uuid
+  key         String  @db.VarChar(120)
+  valueText   String? @map("value_text")
+  valueJson   Json?   @map("value_json")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  contact   Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([contactId, key])
+  @@index([workspaceId, key])
+  @@map("contact_custom_fields")
+}
+
+/// Consent / source / engagement history. Append-only by convention.
+model ContactEvent {
+  id          String   @id @default(uuid()) @db.Uuid
+  workspaceId String   @map("workspace_id") @db.Uuid
+  contactId   String   @map("contact_id") @db.Uuid
+  /// e.g. IMPORTED, CONSENT_CHANGED, SUPPRESSED, SUPPRESSION_LIFTED, STATUS_CHANGED
+  type        String   @db.VarChar(80)
+  occurredAt  DateTime @default(now()) @map("occurred_at") @db.Timestamptz
+  metadata    Json?    @map("metadata_json")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+  contact   Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([contactId, occurredAt])
+  @@index([workspaceId, type])
+  @@map("contact_events")
+}
+
+model Tag {
+  id          String   @id @default(uuid()) @db.Uuid
+  workspaceId String   @map("workspace_id") @db.Uuid
+  name        String   @db.VarChar(80)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  workspace Workspace    @relation(fields: [workspaceId], references: [id])
+  contacts  ContactTag[]
+
+  @@unique([workspaceId, name])
+  @@map("tags")
+}
+
+model ContactTag {
+  contactId String @map("contact_id") @db.Uuid
+  tagId     String @map("tag_id") @db.Uuid
+
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  tag     Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([contactId, tagId])
+  @@index([tagId])
+  @@map("contact_tags")
+}
+
+/// Global send-eligibility guard. Keyed by EMAIL (not contact_id) so it survives
+/// contact deletion and re-imports (FR-CON-005). A contact is send-eligible only if it has
+/// NO row here with active = true AND (expires_at IS NULL OR expires_at > now()).
+///
+/// The "one active row per email+reason" rule is a PARTIAL unique index, which Prisma
+/// can't express. Add it by hand in the migration (see the SQL in the Phase 1A notes).
+model Suppression {
+  id              String            @id @default(uuid()) @db.Uuid
+  workspaceId     String            @map("workspace_id") @db.Uuid
+  emailNormalized String            @map("email_normalized") @db.VarChar(320)
+  reasonType      SuppressionReason @map("reason_type")
+  /// Where it came from: "webhook:ses", "import", "unsubscribe_link", "user:<id>", ...
+  source          String            @db.VarChar(80)
+  reasonDetail    String?           @map("reason_detail")
+  active          Boolean           @default(true)
+  effectiveAt     DateTime          @default(now()) @map("effective_at") @db.Timestamptz
+  expiresAt       DateTime?         @map("expires_at") @db.Timestamptz
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id])
+
+  // Serves the eligibility NOT EXISTS lookup and the suppression list search.
+  @@index([workspaceId, emailNormalized, active])
+  @@index([workspaceId, reasonType, active])
+  @@map("suppressions")
+}
+
+/// One import session. The uploaded file lives in object storage (file_key), never in the DB.
+model Import {
+  id          String       @id @default(uuid()) @db.Uuid
+  workspaceId String       @map("workspace_id") @db.Uuid
+  fileKey     String       @map("file_key")
+  filename    String       @db.VarChar(255)
+  fileType    String       @map("file_type") @db.VarChar(32)
+  status      ImportStatus @default(UPLOADED)
+  /// { "Email": "email", "First Name": "firstName", ... }
+  mappingJson Json?        @map("mapping_json")
+  /// { total, new, existing, duplicateInFile, invalid, suppressed, created, updated, skipped, failed }
+  statsJson   Json?        @map("stats_json")
+  createdById String       @map("created_by") @db.Uuid
+  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz
+
+  workspace Workspace   @relation(fields: [workspaceId], references: [id])
+  createdBy User        @relation(fields: [createdById], references: [id])
+  rows      ImportRow[]
+
+  @@index([workspaceId, createdAt])
+  @@map("imports")
+}
+
+/// Row-level result. raw_json holds the original row; delete rows after the retention window.
+model ImportRow {
+  id             String           @id @default(uuid()) @db.Uuid
+  importId       String           @map("import_id") @db.Uuid
+  rowNumber      Int              @map("row_number")
+  rawJson        Json             @map("raw_json")
+  normalizedJson Json?            @map("normalized_json")
+  outcome        ImportRowOutcome @default(PENDING)
+  /// e.g. INVALID_EMAIL, DUPLICATE_IN_FILE, SUPPRESSED_UNSUBSCRIBE, DB_ERROR
+  reasonCode     String?          @map("reason_code") @db.VarChar(80)
+
+  import Import @relation(fields: [importId], references: [id], onDelete: Cascade)
+
+  @@unique([importId, rowNumber])
+  @@index([importId, outcome])
+  @@map("import_rows")
 }
